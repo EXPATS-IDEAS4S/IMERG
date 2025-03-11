@@ -6,14 +6,67 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from glob import glob
 import pandas as pd
-import xesmf as xe
+from scipy.interpolate import griddata
+
+def regrid_with_scipy(ds, target_grid, var_name):
+    """
+    Perform regridding using SciPy's griddata.
+    """
+    # Extract original lat/lon and precipitation data
+    orig_lats = ds.lat.values.squeeze()
+    orig_lons = ds.lon.values.squeeze()
+    orig_precip = ds.values.squeeze()
+    time = ds.time.values[0]  # Preserve time coordinate
+    
+    # Create meshgrid for original data
+    lon_orig_mesh, lat_orig_mesh = np.meshgrid(orig_lons, orig_lats, indexing="ij")
+    points = np.array([lon_orig_mesh.ravel(), lat_orig_mesh.ravel()]).T
+    values = orig_precip.ravel()
+    
+    # Create target grid mesh
+    lon_target_mesh, lat_target_mesh = np.meshgrid(target_grid["lon"], target_grid["lat"], indexing="ij")
+    target_points = np.array([lon_target_mesh.ravel(), lat_target_mesh.ravel()]).T
+    
+    # Perform interpolation
+    precip_regridded = griddata(points, values, target_points, method="nearest")
+    precip_regridded = precip_regridded.reshape(lon_target_mesh.shape)
+    
+    # Convert to xarray DataArray (without time initially)
+    da_regridded = xr.DataArray(
+        precip_regridded.astype('float32'),
+        dims=("lon", "lat"),
+        coords={
+            "lon": target_grid["lon"].astype('float32'),
+            "lat": target_grid["lat"].astype('float32')
+           
+        },
+        name=var_name
+    )
+    
+    # Expand to include time dimension
+    da_regridded = da_regridded.expand_dims(time=[time])
+
+    return da_regridded
+
+# Define plotting function
+def plot_precip(ax, data, title, cmap="tab20c_r"):
+    lon_grid, lat_grid = np.meshgrid(data.lon.values, data.lat.values, indexing="ij")
+    im = ax.pcolormesh(lon_grid, lat_grid, data.values, transform=ccrs.PlateCarree(), cmap=cmap, vmin=0, vmax=10)
+    ax.coastlines()
+    ax.add_feature(cfeature.BORDERS, linestyle=":")
+    ax.add_feature(cfeature.LAND, facecolor="lightgray")
+    ax.set_extent([lonmin, lonmax, latmin, latmax], crs=ccrs.PlateCarree())
+    cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.7, extend="max")
+    cbar.set_label("Precipitation (mm/hr)")
+    ax.set_title(title)
 
 # Years to process
-years = [2013,2014, 2015, 2016]
+years = [2013, 2014, 2015, 2016]
 
 # Define date range for plotting
-date_low_plot = np.datetime64("2013-04-02T00:00:00Z")
-date_high_plot = np.datetime64("2013-04-03T00:00:00Z")
+plot = False
+date_low_plot = np.datetime64("2013-04-01T00:00:00Z")
+date_high_plot = np.datetime64("2013-04-02T00:00:00Z")
 
 var = "precipitation"
 
@@ -35,7 +88,7 @@ for year in years:
     # Define input/output directories
     data_dir = f"/data/sat/msg/IMERG/{year}"
     fig_output_dir = f"/work/dcorradi/IMERG/fig/{year}"
-    nc_output_dir = f"/work/dcorradi/IMERG/data/{year}"
+    nc_output_dir = f"/work/dcorradi/IMERG/data/"
     os.makedirs(fig_output_dir, exist_ok=True)
     os.makedirs(nc_output_dir, exist_ok=True)
 
@@ -43,100 +96,87 @@ for year in years:
     nc_files = sorted(glob(os.path.join(data_dir, "*.nc4")))
     print(f"📂 Found {len(nc_files)} NetCDF files in {data_dir}")
 
-    daily_datasets = {}  # Dictionary to store datasets by date
+    current_date = None
+    daily_datasets = []
 
-    # Loop through each file
     for file in nc_files:
         file_path = os.path.join(data_dir, file)
-
-        # Open dataset
         ds = xr.open_dataset(file_path)
+        #print(ds)
+        
         print(f"📂 Processing File: {file}")
 
-        # Check if precipitation variable exists
         if var in ds.variables:
             ds_prec = ds[var]
+            #print(ds_prec)
         else:
             print(f"⚠️ Variable {var} not found in {file}")
             ds.close()
             continue
 
-        # Select first time step
         if "time" in ds_prec.dims:
-            precip = ds_prec.isel(time=0)
-            #convert time to pandas datetime
+            #precip = ds_prec.isel(time=0)
             time_np = np.datetime64(ds.time.values[0])
             time_pd = pd.to_datetime(str(time_np))
             print(f"🕒 Time: {time_pd}")
-            exit()
 
-        # Extract date (YYYY-MM-DD) for daily merging
-        month = time_pd.month
-        day = time_pd.day
-        date_str = f"{year}-{month:02d}-{day:02d}"
+        date_str = time_pd.strftime("%Y-%m-%d")
 
-        # Create a regridding target dataset
-        ds_target = xr.Dataset(
-            {"lat": (["lat"], target_grid["lat"]), "lon": (["lon"], target_grid["lon"])}
-        )
+        if current_date is None:
+            current_date = date_str
 
-        # Create regridder
-        regridder = xe.Regridder(ds, ds_target, "linear", periodic=True)
+        # If the day changes, merge and save the previous day's dataset
+        if date_str != current_date and daily_datasets:
+            merged_ds = xr.concat(daily_datasets, dim="time")
+            merged_ds.attrs = daily_datasets[0].attrs
+            
+            month_output_dir = os.path.join(nc_output_dir, current_date[:4], current_date[5:7])
+            os.makedirs(month_output_dir, exist_ok=True)
+            output_nc_file = os.path.join(month_output_dir, f"IMERG_daily_{current_date}.nc")
 
-        # Apply regridding
-        precip_regridded = regridder(precip)
+            comp = dict(zlib=True, complevel=5)
+            encoding = {var: comp}
+            
+            merged_ds.to_netcdf(output_nc_file, encoding=encoding)
+            print(f"💾 Saved daily dataset: {output_nc_file}")
 
-        # Save the dataset for merging
-        if date_str not in daily_datasets:
-            daily_datasets[date_str] = []
-        daily_datasets[date_str].append(precip_regridded)
+            # Reset for new day
+            daily_datasets = []
+            current_date = date_str
 
-        if time_pd > date_low_plot and time_pd < date_high_plot:
-        
-            # Plot side-by-side comparison
-            fig, axes = plt.subplots(ncols=2, figsize=(12, 5), subplot_kw={"projection": ccrs.PlateCarree()})
+        # Process current file
+        precip_regridded = regrid_with_scipy(ds_prec, target_grid, var)
+        precip_regridded = precip_regridded.where(precip_regridded != -9999.9)
+        #print(precip_regridded.time)
+       
+        daily_datasets.append(precip_regridded)
 
-            # Define plotting function
-            def plot_precip(ax, data, title, cmap="tab20c_r"):
-                lon_grid, lat_grid = np.meshgrid(data.lon.values, data.lat.values, indexing="ij")
-                im = ax.pcolormesh(lon_grid, lat_grid, data.values, transform=ccrs.PlateCarree(), cmap=cmap, vmin=0, vmax=10)
-                ax.coastlines()
-                ax.add_feature(cfeature.BORDERS, linestyle=":")
-                ax.add_feature(cfeature.LAND, facecolor="lightgray")
-                ax.set_extent([lonmin, lonmax, latmin, latmax], crs=ccrs.PlateCarree())
-                cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.7, extend="max")
-                cbar.set_label("Precipitation (mm/hr)")
-                ax.set_title(title)
-
-            # Plot original data
-            plot_precip(axes[0], precip, "Original Grid")
-
-            # Plot regridded data
+        if plot and (date_low_plot <= time_pd <= date_high_plot):
+            fig, axes = plt.subplots(ncols=2, figsize=(10, 5), subplot_kw={"projection": ccrs.PlateCarree()})
+            plot_precip(axes[0], ds_prec, "Original Grid (0.1°)")
             plot_precip(axes[1], precip_regridded, f"Regridded ({res_grid}°)")
-
-            # Save figure
-            output_file = os.path.join(fig_output_dir, f"IMERG_{date_str}.png")
+            plt.suptitle(f"{time_pd.strftime('%Y-%m-%d %H:%M')} UTC")
+            plt.subplots_adjust(hspace=0.5)
+            output_file = os.path.join(fig_output_dir, f"IMERG_{time_pd}.png")
             plt.savefig(output_file, bbox_inches="tight")
             plt.close()
             print(f"📊 Saved plot: {output_file}")
 
-        # Close dataset
         ds.close()
 
-    # Merge and save daily datasets
-    for date_str, datasets in daily_datasets.items():
-        merged_ds = xr.concat(datasets, dim="time")  # Merge all time steps for the same day
-        merged_ds = merged_ds.mean(dim="time")  # Compute daily mean
-
-        # Define output directory and filename
-        year_month = date_str[:7]  # YYYY-MM format
-        month_output_dir = os.path.join(nc_output_dir, year_month)
+    # Save the last day's dataset
+    if daily_datasets:
+        merged_ds = xr.concat(daily_datasets, dim="time")
+        merged_ds.attrs = daily_datasets[0].attrs
+        
+        month_output_dir = os.path.join(nc_output_dir, current_date[:4], current_date[5:7])
         os.makedirs(month_output_dir, exist_ok=True)
-        output_nc_file = os.path.join(month_output_dir, f"IMERG_daily_{date_str}.nc")
+        output_nc_file = os.path.join(month_output_dir, f"IMERG_daily_{current_date}.nc")
 
-        # Save with compression
-        comp = dict(zlib=True, complevel=5)  # Compression level 5 (balance between speed and size)
+        comp = dict(zlib=True, complevel=5)
         encoding = {var: comp}
-
+        
         merged_ds.to_netcdf(output_nc_file, encoding=encoding)
         print(f"💾 Saved daily dataset: {output_nc_file}")
+
+#2896554 nohup
